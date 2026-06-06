@@ -27,6 +27,7 @@ __pycache__/
 # Logs and Debug
 *.log
 firebase-debug.log*
+.firebase/
 
 # Editor and OS
 .vscode/
