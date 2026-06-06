@@ -1,0 +1,36 @@
+# Virtual environments
+.venv/
+backend/.venv/
+env/
+venv/
+
+# Node/Next.js
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+frontend/build/
+
+# Backend runtime data
+backend/data/
+backend/reports/
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*$py.class
+*.sqlite3
+
+# Environment variables & API keys
+.env
+.env.*
+!.env.example
+
+# Logs and Debug
+*.log
+firebase-debug.log*
+
+# Editor and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+.qodo/

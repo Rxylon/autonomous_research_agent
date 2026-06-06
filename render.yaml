@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: ai-research-backend
+    env: docker
+    dockerContext: backend
+    dockerfilePath: backend/Dockerfile
+    plan: free
+    region: ohio
+    envVars:
+      - key: DEFAULT_LLM_PROVIDER
+        value: gemini
+      - key: GEMINI_API_KEY
+        sync: false # Requires manual entry in Render Dashboard
+      - key: CORS_ORIGINS
+        value: https://research-ai-assistant-e5306.web.app
