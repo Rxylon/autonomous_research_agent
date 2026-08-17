@@ -5,6 +5,7 @@ import { motion } from "framer-motion";
 
 import { ErrorState } from "@/components/ui/error-state";
 import { fetchHealth, fetchHistory } from "@/services/api";
+import type { HealthStatus } from "@/types/research";
 
 /* ── Animation config ─────────────────────────── */
 const ease: [number, number, number, number] = [0.25, 0.46, 0.45, 0.94];
@@ -18,6 +19,21 @@ const fadeUp = {
   hidden: { opacity: 0, y: 16 },
   show: { opacity: 1, y: 0, transition: { duration: 0.45, ease } },
 };
+
+const notReported = "not reported";
+
+/**
+ * Describe the provider without inventing a state. A backend that predates the
+ * runtime-reporting fields sends none of these, and claiming "no key" on that basis
+ * would be a guess presented as fact.
+ */
+function describeProvider(health: HealthStatus): string {
+  if (health.llm_provider === undefined) return notReported;
+  if (health.llm_configured === undefined) return health.llm_provider;
+  return health.llm_configured
+    ? `${health.llm_provider} (${health.llm_model ?? "model not reported"})`
+    : `${health.llm_provider} — no key, using local fallback`;
+}
 
 export default function DashboardPage() {
   const { data, error } = useQuery({ queryKey: ["history"], queryFn: fetchHistory, retry: false });
@@ -97,7 +113,9 @@ export default function DashboardPage() {
         </motion.div>
       )}
 
-      {/* ── Backend runtime ─────────────────────────── */}
+      {/* ── Backend runtime ───────────────────────────
+          Fields are reported as "not reported" when absent rather than guessed at:
+          the backend deploys separately and an older one omits all of these. */}
       {health && (
         <motion.div variants={fadeUp} className="space-y-12">
           <p className="text-[10px] font-[500] uppercase tracking-[0.1em] text-fire-orange">
@@ -105,9 +123,14 @@ export default function DashboardPage() {
           </p>
           <dl className="grid gap-x-24 gap-y-8 text-[14px] sm:grid-cols-2">
             {[
-              ["LLM provider", health.llm_configured ? `${health.llm_provider} (${health.llm_model})` : `${health.llm_provider} — no key, using local fallback`],
-              ["Embeddings", health.embedding_backend],
-              ["Indexed chunks", String(health.vector_store_documents)],
+              ["LLM provider", describeProvider(health)],
+              ["Embeddings", health.embedding_backend ?? notReported],
+              [
+                "Indexed chunks",
+                health.vector_store_documents === undefined
+                  ? notReported
+                  : String(health.vector_store_documents),
+              ],
             ].map(([label, value]) => (
               <div key={label} className="flex justify-between gap-12 border-b border-frost-gray/40 pb-6">
                 <dt className="text-slate-gray">{label}</dt>
@@ -115,6 +138,12 @@ export default function DashboardPage() {
               </div>
             ))}
           </dl>
+          {health.llm_configured === undefined && (
+            <p className="text-[12px] leading-[1.5] text-silver-mist">
+              This backend predates the runtime-reporting fields, so its LLM and embedding
+              configuration cannot be read. Redeploy the backend to see them.
+            </p>
+          )}
         </motion.div>
       )}
 

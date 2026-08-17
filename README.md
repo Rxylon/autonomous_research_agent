@@ -71,7 +71,7 @@ Both tiers are free, and the trade-offs are structural rather than bugs. **Every
 | WebSocket live progress | ✅ | ✅ (Render supports WebSockets) |
 | First-request latency | ~1 s | **~50 s** — free instances sleep after 15 min idle and cold-start the whole Docker image |
 | LLM summarization + claim checking | ✅ with a key | Depends on the key set in the Render dashboard. If absent, invalid, or rate-limited, summaries fall back to a **mechanical listing** and scores become keyword heuristics. `GET /health` reports this in `llm_configured` and `last_llm_error`, and the UI shows a banner. |
-| Semantic vector search | ✅ Sentence-Transformers (`bge-small-en-v1.5`) | ❌ **Lexical only.** 512 MB RAM cannot hold torch plus a transformer, so the deploy pins `EMBEDDING_BACKEND=hash` — a deterministic hashed bag-of-words. Retrieval still works but matches on shared tokens, not meaning. |
+| Semantic vector search | ✅ Sentence-Transformers (`bge-small-en-v1.5`), via `requirements-local.txt` | ❌ **Lexical only.** 512 MB RAM cannot hold torch plus a transformer, so the image omits both and pins `EMBEDDING_BACKEND=hash` — a deterministic hashed bag-of-words. Retrieval still works but matches on shared tokens, not meaning. |
 | Run history | ✅ persists in `data/history.jsonl` | ⚠️ **Resets on restart.** The filesystem is ephemeral, so History, Reports, and Analytics empty out whenever the instance sleeps. |
 | Uploaded documents (`POST /upload`) | ✅ persist and influence later queries | ⚠️ Work within a session; the Chroma index is lost on restart |
 | Markdown / JSON report download | ✅ | ✅ while the run is still in history (served from history, not disk) |
@@ -102,11 +102,17 @@ python -m venv .venv
 .venv\Scripts\Activate.ps1        # Windows PowerShell
 # source .venv/bin/activate       # macOS / Linux
 
-pip install -r requirements.txt   # ~2 GB: pulls torch for local embeddings
+# Core install — full pipeline, lexical (hashed) embeddings. ~200 MB.
+pip install -r requirements.txt
+
+# Optional: add semantic embeddings (Sentence-Transformers + torch, ~2 GB).
+# pip install -r requirements-local.txt
 
 cp .env.example .env              # then edit .env
 uvicorn app.main:app --reload --port 8000
 ```
+
+Both installs run the complete five-stage pipeline. The only difference is retrieval quality: `requirements.txt` alone matches on shared tokens, `requirements-local.txt` matches on meaning. `GET /health` reports which tier is active under `embedding_backend`, so you never have to guess.
 
 Verify what is actually live — this is the fastest way to catch a misconfigured key:
 
@@ -352,16 +358,15 @@ firebase deploy --only hosting
 
 ### Backend → Render (Docker)
 
-`render.yaml` defines the service. The Dockerfile installs CPU-only torch first to avoid ~2 GB of unused CUDA binaries.
-
-Set `GEMINI_API_KEY` in the Render dashboard — never in the repo.
+`render.yaml` defines the service; it deploys on push once the blueprint is connected. Set `GEMINI_API_KEY` in the Render dashboard — never in the repo.
 
 ```bash
-# Deploys on push once the blueprint is connected.
 git push origin master
 ```
 
-If you stay on `EMBEDDING_BACKEND=hash`, removing `sentence-transformers` from `requirements.txt` drops roughly 2 GB from the image and cuts cold-start time substantially, since torch is then unnecessary.
+The image installs `requirements.txt` only, so it contains **no torch and no sentence-transformers**, and `EMBEDDING_BACKEND=hash` is set in both the Dockerfile and `render.yaml`. That is what makes the image small enough to build and start on a free instance.
+
+If you need semantic embeddings in a container, switch the Dockerfile to `requirements-local.txt` **and** read the index-URL note in that file. Installing CPU torch with only `--index-url https://download.pytorch.org/whl/cpu` breaks the build: that flag *replaces* PyPI rather than adding to it, so any package pip has to build from source cannot resolve its build backend, and the layer fails with `No matching distribution found for flit_core`. Pass `--extra-index-url https://pypi.org/simple` alongside it.
 
 ---
 

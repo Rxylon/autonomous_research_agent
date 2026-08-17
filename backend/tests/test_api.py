@@ -80,6 +80,16 @@ class TestHealthAndConfig:
         monkeypatch.setattr(llm_provider, "_last_error", None)
         assert client.get("/health").json()["last_llm_error"] is None
 
+    def test_health_always_states_llm_configured_explicitly(self, client):
+        """The frontend distinguishes `false` from absent — absent means an older
+        backend that did not report, and warning on absence would have the UI claim
+        something it was never told. So this field must always be present."""
+        body = client.get("/health").json()
+        assert "llm_configured" in body
+        assert isinstance(body["llm_configured"], bool)
+        for field in ("llm_provider", "llm_model", "embedding_backend", "vector_store_documents"):
+            assert field in body, f"/health omitted {field}"
+
 
 class TestQueryEndpoint:
     def test_full_run_returns_a_complete_result(self, client):

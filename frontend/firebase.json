@@ -6,10 +6,32 @@
       "**/.*",
       "**/node_modules/**"
     ],
-    "rewrites": [
+
+    "//1": "cleanUrls makes /dashboard serve dashboard.html. This replaced a catch-all rewrite of ** -> /index.html, which was wrong for a Next.js static export: `output: export` emits a real HTML file per route (dashboard.html, history.html, reports.html, reports/detail.html), and the rewrite intercepted every request before extension resolution, so ALL deep links served the home page. Client-side navigation hid it - the Next router rendered the right page once loaded - but a hard refresh, a bookmark, or a shared link landed on the chat page. Unmatched paths now fall through to the exported 404.html.",
+    "cleanUrls": true,
+    "trailingSlash": false,
+
+    "//2": "Order matters: Firebase applies the LAST matching rule for a given header key, so the broad rule comes first and the specific override comes after. Verified empirically - with the catch-all placed second, it clobbered the immutable rule for _next/static.",
+    "headers": [
       {
+        "//": "Default for HTML pages and RSC .txt payloads, which are NOT content-hashed: the same URL must serve new bytes after a deploy. Firebase's default of max-age=3600 meant a deploy stayed invisible at the CDN edge for up to an hour, with stale HTML still pointing at the previous build's chunks. no-cache still stores the response but revalidates against the ETag first, so a deploy is visible immediately and an unchanged page costs only a 304. This must be a catch-all: header globs match the REQUEST path, and a clean route like /dashboard has no .html extension to match on.",
         "source": "**",
-        "destination": "/index.html"
+        "headers": [
+          {
+            "key": "Cache-Control",
+            "value": "no-cache, must-revalidate"
+          }
+        ]
+      },
+      {
+        "//": "Override for build assets. Next.js content-hashes everything under _next/static, so a given URL's bytes never change - cache for a year and skip revalidation entirely.",
+        "source": "/_next/static/**",
+        "headers": [
+          {
+            "key": "Cache-Control",
+            "value": "public, max-age=31536000, immutable"
+          }
+        ]
       }
     ]
   }

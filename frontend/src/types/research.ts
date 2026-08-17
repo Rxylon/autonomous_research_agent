@@ -60,14 +60,23 @@ export type HistoryItem = {
   } | null;
 };
 
+/**
+ * Response from `GET /health`.
+ *
+ * Only `status` is guaranteed. Everything else is optional because the frontend and
+ * backend deploy independently — a freshly deployed UI routinely talks to a backend
+ * that predates these fields. Treating a missing field as `false` would make the UI
+ * state things about the backend that it has not been told, so absent and false are
+ * kept distinct throughout.
+ */
 export type HealthStatus = {
   status: string;
-  llm_provider: string;
-  /** False means every summary comes from the local deterministic fallback. */
-  llm_configured: boolean;
-  llm_model: string;
-  embedding_backend: string;
-  vector_store_documents: number;
+  llm_provider?: string;
+  /** False means every summary comes from the local deterministic fallback. Undefined means the backend did not say. */
+  llm_configured?: boolean;
+  llm_model?: string;
+  embedding_backend?: string;
+  vector_store_documents?: number;
   /**
    * Most recent provider failure. Non-null while `llm_configured` is true means a key
    * is present but calls are failing (invalid key, quota, rate limit) — so summaries

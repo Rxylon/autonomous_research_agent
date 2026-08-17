@@ -1,0 +1,23 @@
+# Local development with semantic embeddings.
+#
+#     pip install -r requirements-local.txt
+#
+# Adds Sentence-Transformers (and therefore torch, ~2 GB) on top of the core
+# requirements, which enables EMBEDDING_BACKEND=auto/local. Without this, the
+# vector store still works but matches lexically — GET /health reports which tier
+# is live under `embedding_backend`.
+#
+# On Linux, plain `pip install sentence-transformers` pulls the CUDA build of
+# torch. To force the much smaller CPU build, install torch first and keep PyPI
+# reachable for build dependencies:
+#
+#     pip install torch --index-url https://download.pytorch.org/whl/cpu \
+#                       --extra-index-url https://pypi.org/simple
+#
+# The --extra-index-url matters. Passing only --index-url replaces PyPI entirely,
+# so any package pip has to build from source fails to resolve its build backend
+# (flit_core, setuptools, hatchling), which is what broke the Docker build.
+
+-r requirements.txt
+
+sentence-transformers>=3.0.1

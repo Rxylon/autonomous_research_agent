@@ -173,15 +173,19 @@ export function ResearchConsole() {
       {/* ── Backend capability banner ─────────────────
           Two distinct degraded states, and they need different explanations:
           no key at all, versus a key whose calls are failing. Both mean summaries
-          come from the local fallback, but only the second is a bug to chase. */}
-      {health && (!health.llm_configured || health.last_llm_error) && (
+          come from the local fallback, but only the second is a bug to chase.
+
+          Note the `=== false`: an older backend omits `llm_configured` entirely, and
+          `undefined` means "not reported", not "no key". Warning on absence would
+          have this UI assert something it was never told. */}
+      {health && (health.llm_configured === false || health.last_llm_error) && (
         <motion.div
           initial={{ opacity: 0, y: -8 }}
           animate={{ opacity: 1, y: 0 }}
           className="flex items-start gap-10 rounded-cards border border-amber-300/60 bg-amber-50 p-16 text-[13px] leading-[1.54] text-amber-900"
         >
           <AlertTriangle className="mt-[2px] h-[15px] w-[15px] shrink-0" />
-          {!health.llm_configured ? (
+          {health.llm_configured === false ? (
             <span>
               <strong className="font-[500]">No LLM key configured on this backend.</strong>{" "}
               Retrieval, verification plumbing, and reporting all work, but summaries come from a
