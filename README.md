@@ -125,7 +125,7 @@ curl http://localhost:8000/health
   "status": "ok",
   "llm_provider": "gemini",
   "llm_configured": true,
-  "llm_model": "gemini-2.0-flash",
+  "llm_model": "gemini-3.6-flash",
   "embedding_backend": "sentence-transformers",
   "vector_store_documents": 128,
   "last_llm_error": null
@@ -189,7 +189,8 @@ User query ──► POST /query          │  ChromaDB (persistent)  │
 | Variable | Default | Notes |
 |---|---|---|
 | `DEFAULT_LLM_PROVIDER` | `mock` | `gemini`, `openai`, or `mock` |
-| `DEFAULT_LLM_MODEL` | `gemini-2.0-flash` | `gemini-2.0-flash`, `gemini-2.5-flash`, `gpt-4o-mini`, … |
+| `DEFAULT_LLM_MODEL` | `gemini-3.6-flash` | Perishable — see [model retirement](#model-retirement). `GET /models` lists what your key serves. |
+| `GEMINI_FALLBACK_MODELS` | `gemini-flash-latest,gemini-2.5-flash` | Tried if the configured model is retired |
 | `GEMINI_API_KEY` / `OPENAI_API_KEY` | — | Only the one for your provider |
 | `EMBEDDING_BACKEND` | `auto` | `auto`, `local`, `hash`, `openai`. Use `hash` under ~2 GB RAM. |
 | `EMBEDDING_MODEL` | `BAAI/bge-small-en-v1.5` | Note the `-en-`; the id without it does not exist |
@@ -223,6 +224,7 @@ Switching `EMBEDDING_BACKEND` starts a **fresh Chroma collection** — the colle
 | `GET` | `/reports/{run_id}.json` | Download JSON (from history) |
 | `GET` | `/reports/{run_id}.pdf` | Download PDF (from disk; `410` if lost) |
 | `GET` | `/health` | Provider, key status, embedding tier, last provider error |
+| `GET` | `/models` | Models the configured provider will actually serve |
 | `GET` | `/config` | Non-secret runtime config, incl. `engine` |
 
 ### `POST /query`
@@ -304,7 +306,9 @@ Deliberate trade-offs, stated plainly rather than implied away.
 
 9. **There is no auth, and no rate limiting.** Anyone who can reach the backend can spend your LLM quota. Do not expose a keyed deployment publicly without putting something in front of it.
 
-10. **A rotated key is still required.** A live Gemini key was previously committed to `backend/.env.example` and is in this repository's public git history. It has been removed from the working tree, but **git history is not rewritten**, so that key must be treated as compromised and rotated. Anything in `.env` never entered history and is unaffected.
+10. **Model ids are perishable.** <a id="model-retirement"></a>Google retires Gemini models on a rolling basis, and a retired id fails silently: the call 404s, every summary drops to the local fallback, and from the outside that is indistinguishable from a broken deployment. This bit the live demo — `gemini-2.0-flash` started returning *"no longer available. Please update your code to use models/gemini-3.6-flash"*. Three things now cover it: the successor named in the 404 is tried automatically, `GEMINI_FALLBACK_MODELS` is tried after that, and `GET /models` lists what your key actually serves so you never have to guess. `GET /health` reports the underlying error either way.
+
+11. **A rotated key is still required.** A live Gemini key was previously committed to `backend/.env.example` and is in this repository's public git history. It has been removed from the working tree, but **git history is not rewritten**, so that key must be treated as compromised and rotated. Anything in `.env` never entered history and is unaffected.
 
 ---
 

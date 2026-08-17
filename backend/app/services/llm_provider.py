@@ -219,11 +219,45 @@ def _call_openai(prompt: str, config: ProviderConfig) -> str | None:
 
 
 def _gemini_model_name(model: str) -> str:
-    """google-genai accepts either ``gemini-2.0-flash`` or ``models/gemini-2.0-flash``.
+    """google-genai accepts either ``gemini-3.6-flash`` or ``models/gemini-3.6-flash``.
 
     Normalise to the bare name, which both the current and legacy SDKs accept.
     """
     return model[len("models/") :] if model.startswith("models/") else model
+
+
+# "This model models/gemini-2.0-flash is no longer available. Please update your
+# code to use models/gemini-3.6-flash for the latest features and improvements."
+_SUGGESTED_MODEL = re.compile(r"use\s+(?:models/)?([A-Za-z0-9.\-]+)\s+for", re.IGNORECASE)
+
+
+def _is_model_unavailable(error: str) -> bool:
+    lowered = error.lower()
+    return "not_found" in lowered or "no longer available" in lowered or "is not found" in lowered
+
+
+def _gemini_candidate_models(config: ProviderConfig, error: str | None = None) -> list[str]:
+    """Ordered model candidates: the configured one, the API's own suggested
+    replacement (parsed from the 404 text), then the configured fallbacks.
+
+    Using the API's suggestion is the most reliable source available — it names the
+    successor model rather than making us guess from a hardcoded list that will go
+    stale the same way.
+    """
+    candidates = [_gemini_model_name(config.model)]
+
+    if error:
+        match = _SUGGESTED_MODEL.search(error)
+        if match:
+            candidates.append(_gemini_model_name(match.group(1)))
+
+    for fallback in (settings.gemini_fallback_models or "").split(","):
+        fallback = _gemini_model_name(fallback.strip())
+        if fallback:
+            candidates.append(fallback)
+
+    seen: set[str] = set()
+    return [c for c in candidates if not (c in seen or seen.add(c))]
 
 
 def _call_gemini(prompt: str, config: ProviderConfig) -> str | None:
@@ -236,7 +270,6 @@ def _call_gemini(prompt: str, config: ProviderConfig) -> str | None:
     that: a live deployment reported "No module named 'google.generativeai'" while
     the actual cause was an invalid key.)
     """
-    model = _gemini_model_name(config.model)
     primary_error: str | None = None
 
     # Preferred: google-genai >= 1.0 Client API.
@@ -246,12 +279,37 @@ def _call_gemini(prompt: str, config: ProviderConfig) -> str | None:
 
             client = genai.Client(api_key=config.gemini_key)
             try:
-                response = client.models.generate_content(model=model, contents=prompt)
-                text = (getattr(response, "text", None) or "").strip()
-                _trace(f"gemini genai.Client model={model} chars={len(text)}")
-                if text:
-                    return text
-                primary_error = "gemini google-genai returned an empty response"
+                # Walk candidates only while the failure is "this model is gone".
+                # Any other error (bad key, quota, safety block) is not fixed by
+                # trying a different model, so stop and report it.
+                candidates = _gemini_candidate_models(config)
+                index = 0
+                while index < len(candidates):
+                    model = candidates[index]
+                    try:
+                        response = client.models.generate_content(model=model, contents=prompt)
+                        text = (getattr(response, "text", None) or "").strip()
+                        _trace(f"gemini genai.Client model={model} chars={len(text)}")
+                        if text:
+                            if index > 0:
+                                _trace(f"gemini fell back from {config.model!r} to {model!r}")
+                            return text
+                        primary_error = f"gemini google-genai returned an empty response for {model}"
+                        break
+                    except Exception as exc:
+                        message = f"gemini google-genai call failed: {type(exc).__name__}: {exc}"
+                        primary_error = message
+                        if not _is_model_unavailable(message):
+                            break
+                        # If the 404 names a successor, try it immediately rather than
+                        # after the generic fallbacks — the API's own suggestion is the
+                        # most authoritative candidate available.
+                        suggested = _SUGGESTED_MODEL.search(message)
+                        if suggested:
+                            name = _gemini_model_name(suggested.group(1))
+                            if name not in candidates:
+                                candidates.insert(index + 1, name)
+                        index += 1
             finally:
                 close = getattr(client, "close", None)
                 if callable(close):
@@ -260,9 +318,11 @@ def _call_gemini(prompt: str, config: ProviderConfig) -> str | None:
                     except Exception:
                         pass
         except Exception as exc:
-            primary_error = f"gemini google-genai call failed: {type(exc).__name__}: {exc}"
+            primary_error = primary_error or f"gemini google-genai setup failed: {type(exc).__name__}: {exc}"
     else:
         _trace("google-genai not installed; trying legacy google-generativeai")
+
+    model = _gemini_model_name(config.model)
 
     # Legacy: google-generativeai GenerativeModel API.
     if find_spec("google.generativeai") is not None:
@@ -463,6 +523,50 @@ def _fallback_claim_checks(summary: str, documents: List[Any]) -> str:
 # --------------------------------------------------------------------------- #
 # Public API
 # --------------------------------------------------------------------------- #
+
+
+def list_available_models(model_name: str | None = None) -> dict[str, Any]:
+    """Ask the configured provider which models it will actually serve.
+
+    Exists because a retired model id is indistinguishable from a broken deployment
+    from the outside: every summary quietly becomes the local fallback. This turns
+    "guess a model name" into "read the list".
+    """
+    config = resolve_provider_config(model_name)
+    result: dict[str, Any] = {
+        "provider": config.provider,
+        "configured_model": config.model,
+        "candidates_tried_in_order": _gemini_candidate_models(config) if config.provider == "gemini" else [config.model],
+        "available": None,
+        "error": None,
+    }
+
+    if not config.usable:
+        result["error"] = f"provider {config.provider!r} has no API key configured"
+        return result
+
+    try:
+        if config.provider == "gemini":
+            from google import genai  # type: ignore
+
+            client = genai.Client(api_key=config.gemini_key)
+            names = []
+            for model in client.models.list():
+                name = _gemini_model_name(getattr(model, "name", "") or "")
+                actions = getattr(model, "supported_actions", None)
+                # Keep only models that can actually generate text.
+                if name and (not actions or "generateContent" in actions):
+                    names.append(name)
+            result["available"] = sorted(set(names))
+        elif config.provider == "openai":
+            from openai import OpenAI
+
+            client = OpenAI(api_key=config.openai_key)
+            result["available"] = sorted({m.id for m in client.models.list()})
+    except Exception as exc:
+        result["error"] = f"{type(exc).__name__}: {exc}"
+
+    return result
 
 
 def summarize_with_provider(plan: Any, documents: List[Any], model_name: str | None = None) -> str:

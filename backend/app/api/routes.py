@@ -22,7 +22,7 @@ from app.models.schemas import (
 )
 from app.services.embeddings import embedding_backend
 from app.services.history_store import HistoryStore
-from app.services.llm_provider import last_provider_error, resolve_provider_config
+from app.services.llm_provider import last_provider_error, list_available_models, resolve_provider_config
 from app.services.vector_store import get_vector_store
 
 router = APIRouter()
@@ -299,6 +299,17 @@ def health() -> HealthResponse:
         vector_store_documents=vector_store.count(),
         last_llm_error=last_provider_error(),
     )
+
+
+@router.get("/models")
+def available_models() -> dict:
+    """List the models the configured provider will actually serve.
+
+    Diagnostic for the failure this deployment hit: a retired model id makes every
+    summary fall back to the local path, and from the outside that is
+    indistinguishable from a broken deployment. Returns model ids only, never a key.
+    """
+    return list_available_models()
 
 
 @router.get("/config")

@@ -10,8 +10,11 @@ services:
     envVars:
       - key: DEFAULT_LLM_PROVIDER
         value: gemini
+      # Perishable: Google retires Gemini models on a rolling basis, and a retired
+      # id turns every summary into the local fallback. GET /models lists what the
+      # key can actually serve; GET /health surfaces the failure if it happens.
       - key: DEFAULT_LLM_MODEL
-        value: gemini-2.0-flash
+        value: gemini-3.6-flash
       - key: GEMINI_API_KEY
         sync: false # Set in the Render dashboard; never commit a key.
 

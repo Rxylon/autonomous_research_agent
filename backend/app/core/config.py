@@ -40,7 +40,12 @@ class Settings:
     openai_api_key: str | None = getenv("OPENAI_API_KEY") or None
     gemini_api_key: str | None = getenv("GEMINI_API_KEY") or None
     default_llm_provider: str = getenv("DEFAULT_LLM_PROVIDER", "mock")
-    default_llm_model: str = getenv("DEFAULT_LLM_MODEL", "gemini-2.0-flash")
+    default_llm_model: str = getenv("DEFAULT_LLM_MODEL", "gemini-3.6-flash")
+    # Tried in order when the configured model returns "no longer available". Google
+    # retires Gemini models on a rolling basis, and a hardcoded id silently degrades
+    # every summary to the local fallback once its model is withdrawn — which is
+    # exactly what happened to this deployment. Set to an empty string to disable.
+    gemini_fallback_models: str = getenv("GEMINI_FALLBACK_MODELS", "gemini-flash-latest,gemini-2.5-flash")
     # Which embedding tier to use: `auto` (local model, falling back to hashing),
     # `local` (Sentence-Transformers only), `hash` (no model at all), or `openai`.
     # `hash` exists for memory-constrained hosts: loading torch plus a transformer

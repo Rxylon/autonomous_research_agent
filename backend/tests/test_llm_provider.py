@@ -241,6 +241,159 @@ class TestProviderErrorTracking:
         assert "no usable SDK installed" in (llm_provider.last_provider_error() or "")
 
 
+class TestRetiredModelRecovery:
+    """Google retires Gemini models on a rolling basis. A hardcoded id silently turns
+    every summary into the local fallback once its model is withdrawn — which is what
+    happened to the live deployment, with `gemini-2.0-flash` returning
+    404 "no longer available. Please update your code to use models/gemini-3.6-flash".
+    """
+
+    def _fake_genai(self, monkeypatch, behaviour):
+        """Install a fake google.genai whose generate_content delegates to `behaviour`."""
+        calls: list[str] = []
+
+        class FakeModels:
+            def generate_content(self, model, contents):
+                calls.append(model)
+                return behaviour(model)
+
+        class FakeClient:
+            def __init__(self, **_kwargs):
+                self.models = FakeModels()
+
+            def close(self):
+                pass
+
+        google = types.ModuleType("google")
+        genai = types.ModuleType("google.genai")
+        genai.Client = FakeClient  # type: ignore[attr-defined]
+        google.genai = genai  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "google", google)
+        monkeypatch.setitem(sys.modules, "google.genai", genai)
+        monkeypatch.setattr(
+            llm_provider, "find_spec", lambda name: object() if name == "google.genai" else None
+        )
+        return calls
+
+    def test_parses_the_apis_suggested_replacement_and_uses_it(self, monkeypatch):
+        class Ok:
+            text = "summary text"
+
+        def behaviour(model):
+            if model == "gemini-2.0-flash":
+                raise RuntimeError(
+                    "404 NOT_FOUND. This model models/gemini-2.0-flash is no longer available. "
+                    "Please update your code to use models/gemini-3.6-flash for the latest features."
+                )
+            return Ok()
+
+        calls = self._fake_genai(monkeypatch, behaviour)
+        config = ProviderConfig(provider="gemini", model="gemini-2.0-flash", openai_key=None, gemini_key="k")
+
+        assert llm_provider._call_gemini("prompt", config) == "summary text"
+        assert calls[0] == "gemini-2.0-flash"
+        assert "gemini-3.6-flash" in calls, f"suggested successor never tried: {calls}"
+
+    def test_falls_through_to_configured_fallbacks(self, monkeypatch):
+        class Ok:
+            text = "ok"
+
+        def behaviour(model):
+            if model != "gemini-2.5-flash":
+                raise RuntimeError("404 NOT_FOUND: model is no longer available")
+            return Ok()
+
+        calls = self._fake_genai(monkeypatch, behaviour)
+        monkeypatch.setattr(llm_provider.settings, "gemini_fallback_models", "gemini-flash-latest,gemini-2.5-flash")
+        config = ProviderConfig(provider="gemini", model="dead-model", openai_key=None, gemini_key="k")
+
+        assert llm_provider._call_gemini("prompt", config) == "ok"
+        assert calls == ["dead-model", "gemini-flash-latest", "gemini-2.5-flash"]
+
+    def test_a_non_model_error_does_not_trigger_model_cycling(self, monkeypatch):
+        """An invalid key or a quota error is not fixed by trying another model, and
+        cycling would multiply the failed calls."""
+        def behaviour(model):
+            raise RuntimeError("400 INVALID_ARGUMENT: API key not valid")
+
+        calls = self._fake_genai(monkeypatch, behaviour)
+        monkeypatch.setattr(llm_provider, "_last_error", None)
+        config = ProviderConfig(provider="gemini", model="gemini-3.6-flash", openai_key=None, gemini_key="bad")
+
+        assert llm_provider._call_gemini("prompt", config) is None
+        assert calls == ["gemini-3.6-flash"], f"cycled models on a key error: {calls}"
+        assert "API key not valid" in (llm_provider.last_provider_error() or "")
+
+    def test_first_choice_is_used_when_it_works(self, monkeypatch):
+        class Ok:
+            text = "first try"
+
+        calls = self._fake_genai(monkeypatch, lambda model: Ok())
+        config = ProviderConfig(provider="gemini", model="gemini-3.6-flash", openai_key=None, gemini_key="k")
+
+        assert llm_provider._call_gemini("prompt", config) == "first try"
+        assert calls == ["gemini-3.6-flash"]
+
+    def test_all_candidates_exhausted_reports_the_last_error(self, monkeypatch):
+        def behaviour(model):
+            raise RuntimeError("404 NOT_FOUND: no longer available")
+
+        calls = self._fake_genai(monkeypatch, behaviour)
+        monkeypatch.setattr(llm_provider, "_last_error", None)
+        monkeypatch.setattr(llm_provider.settings, "gemini_fallback_models", "a,b")
+        config = ProviderConfig(provider="gemini", model="dead", openai_key=None, gemini_key="k")
+
+        assert llm_provider._call_gemini("prompt", config) is None
+        assert calls == ["dead", "a", "b"]
+        assert "NOT_FOUND" in (llm_provider.last_provider_error() or "")
+
+
+class TestCandidateModelOrdering:
+    def test_configured_model_comes_first(self, monkeypatch):
+        monkeypatch.setattr(llm_provider.settings, "gemini_fallback_models", "b,c")
+        config = ProviderConfig(provider="gemini", model="a", openai_key=None, gemini_key="k")
+        assert llm_provider._gemini_candidate_models(config) == ["a", "b", "c"]
+
+    def test_models_prefix_is_stripped_everywhere(self, monkeypatch):
+        monkeypatch.setattr(llm_provider.settings, "gemini_fallback_models", "models/b")
+        config = ProviderConfig(provider="gemini", model="models/a", openai_key=None, gemini_key="k")
+        assert llm_provider._gemini_candidate_models(config) == ["a", "b"]
+
+    def test_duplicates_are_removed_preserving_order(self, monkeypatch):
+        monkeypatch.setattr(llm_provider.settings, "gemini_fallback_models", "a,b,a")
+        config = ProviderConfig(provider="gemini", model="a", openai_key=None, gemini_key="k")
+        assert llm_provider._gemini_candidate_models(config) == ["a", "b"]
+
+    def test_empty_fallback_setting_disables_cycling(self, monkeypatch):
+        monkeypatch.setattr(llm_provider.settings, "gemini_fallback_models", "")
+        config = ProviderConfig(provider="gemini", model="a", openai_key=None, gemini_key="k")
+        assert llm_provider._gemini_candidate_models(config) == ["a"]
+
+    @pytest.mark.parametrize(
+        "message,expected",
+        [
+            ("This model models/x is no longer available. Please update your code to use models/gemini-3.6-flash for the latest", "gemini-3.6-flash"),
+            ("please update your code to use gemini-9-pro for better results", "gemini-9-pro"),
+        ],
+    )
+    def test_suggested_model_is_parsed(self, monkeypatch, message, expected):
+        monkeypatch.setattr(llm_provider.settings, "gemini_fallback_models", "")
+        config = ProviderConfig(provider="gemini", model="x", openai_key=None, gemini_key="k")
+        assert expected in llm_provider._gemini_candidate_models(config, message)
+
+    @pytest.mark.parametrize(
+        "message,unavailable",
+        [
+            ("404 NOT_FOUND: gone", True),
+            ("This model is no longer available", True),
+            ("400 INVALID_ARGUMENT: API key not valid", False),
+            ("429 RESOURCE_EXHAUSTED: quota", False),
+        ],
+    )
+    def test_model_unavailable_detection(self, message, unavailable):
+        assert llm_provider._is_model_unavailable(message) is unavailable
+
+
 class TestSnippetPreparation:
     def test_numbers_sources_from_one(self, documents):
         snippets = llm_provider._prepare_snippets(documents)
