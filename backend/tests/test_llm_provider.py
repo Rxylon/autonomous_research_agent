@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+import types
 
 import pytest
 
@@ -194,6 +195,50 @@ class TestProviderErrorTracking:
         monkeypatch.setattr(llm_provider, "_last_error", None)
         llm_provider._error("x" * 5000)
         assert len(llm_provider.last_provider_error()) == 500
+
+    def test_missing_legacy_sdk_does_not_mask_the_real_api_error(self, monkeypatch):
+        """Regression: `_call_gemini` tried google-genai, then fell back to the legacy
+        google-generativeai SDK and logged *its* ImportError, overwriting the real
+        error. A live deployment reported "No module named 'google.generativeai'"
+        while the actual cause was an invalid API key — the field was worse than
+        useless, because it pointed at the wrong problem.
+        """
+        monkeypatch.setattr(llm_provider, "_last_error", None)
+
+        def fake_find_spec(name):
+            # google-genai present, legacy SDK absent — the normal install.
+            return object() if name == "google.genai" else None
+
+        monkeypatch.setattr(llm_provider, "find_spec", fake_find_spec)
+
+        class BoomClient:
+            def __init__(self, **_kwargs):
+                self.models = self
+
+            def generate_content(self, **_kwargs):
+                raise RuntimeError("400 API_KEY_INVALID")
+
+        monkeypatch.setitem(sys.modules, "google", types.ModuleType("google"))
+        fake_genai = types.ModuleType("google.genai")
+        fake_genai.Client = BoomClient  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "google.genai", fake_genai)
+        sys.modules["google"].genai = fake_genai  # type: ignore[attr-defined]
+
+        config = ProviderConfig(provider="gemini", model="gemini-2.0-flash", openai_key=None, gemini_key="bad")
+        assert llm_provider._call_gemini("prompt", config) is None
+
+        error = llm_provider.last_provider_error() or ""
+        assert "API_KEY_INVALID" in error, f"real cause lost, got: {error}"
+        assert "No module named" not in error
+        assert "google-generativeai" not in error
+
+    def test_no_sdk_at_all_is_reported_plainly(self, monkeypatch):
+        monkeypatch.setattr(llm_provider, "_last_error", None)
+        monkeypatch.setattr(llm_provider, "find_spec", lambda _name: None)
+
+        config = ProviderConfig(provider="gemini", model="m", openai_key=None, gemini_key="k")
+        assert llm_provider._call_gemini("prompt", config) is None
+        assert "no usable SDK installed" in (llm_provider.last_provider_error() or "")
 
 
 class TestSnippetPreparation:

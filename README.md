@@ -6,7 +6,7 @@
 ![License](https://img.shields.io/badge/license-MIT-blue)
 ![Python](https://img.shields.io/badge/Python-3.10%2B-blue)
 ![Node.js](https://img.shields.io/badge/Node.js-18%2B-green)
-![Tests](https://img.shields.io/badge/tests-142%20passing-brightgreen)
+![Tests](https://img.shields.io/badge/tests-145%20passing-brightgreen)
 
 **Live demo:** [research-ai-assistant-e5306.web.app](https://research-ai-assistant-e5306.web.app) · **API:** [ai-research-backend-y7av.onrender.com/docs](https://ai-research-backend-y7av.onrender.com/docs)
 
@@ -310,7 +310,7 @@ Deliberate trade-offs, stated plainly rather than implied away.
 
 ## Testing
 
-142 pytest tests, none of which touch the network — provider and search calls are stubbed, so the suite is deterministic and free to run.
+145 pytest tests, none of which touch the network — provider and search calls are stubbed, so the suite is deterministic and free to run.
 
 ```bash
 cd backend
@@ -318,7 +318,7 @@ python -m pytest tests/ -q
 ```
 
 ```
-142 passed in 67s
+145 passed in 59s
 ```
 
 Coverage is organised around the regressions that motivated it: that the compiled graph is actually driven, that nodes leave the event loop, that a `supported: false` verdict is never overturned, that the vector store round-trips, that a PDF upload extracts real text, that naive legacy timestamps do not break history sorting.
@@ -394,7 +394,7 @@ autonomous_multi_research_agent/
 │   │   │   └── history_store.py
 │   │   └── main.py
 │   ├── scripts/smoke_e2e.py    # live end-to-end check
-│   ├── tests/                  # 142 pytest tests
+│   ├── tests/                  # 145 pytest tests
 │   ├── data/                   # history.jsonl + chroma/ (gitignored)
 │   ├── reports/                # generated artifacts (gitignored)
 │   ├── Dockerfile

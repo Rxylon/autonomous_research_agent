@@ -24,6 +24,7 @@ import os
 import re
 import time
 from dataclasses import dataclass
+from importlib.util import find_spec
 from typing import Any, Callable, List
 
 from app.core.config import settings
@@ -226,42 +227,66 @@ def _gemini_model_name(model: str) -> str:
 
 
 def _call_gemini(prompt: str, config: ProviderConfig) -> str | None:
-    """Call Gemini via google-genai (preferred) or the legacy google-generativeai."""
+    """Call Gemini via google-genai (preferred) or the legacy google-generativeai.
+
+    Only genuine call failures are recorded as the provider error. An SDK simply not
+    being installed is a trace-level fact, not a diagnosis — recording it would let
+    the legacy path's ``ModuleNotFoundError`` overwrite the real API error from the
+    primary path, which is what ``last_llm_error`` exists to show. (It did exactly
+    that: a live deployment reported "No module named 'google.generativeai'" while
+    the actual cause was an invalid key.)
+    """
     model = _gemini_model_name(config.model)
+    primary_error: str | None = None
 
     # Preferred: google-genai >= 1.0 Client API.
-    try:
-        from google import genai  # type: ignore
-
-        client = genai.Client(api_key=config.gemini_key)
+    if find_spec("google.genai") is not None:
         try:
-            response = client.models.generate_content(model=model, contents=prompt)
-            text = (getattr(response, "text", None) or "").strip()
-            _trace(f"gemini genai.Client model={model} chars={len(text)}")
-            if text:
-                return text
-        finally:
-            close = getattr(client, "close", None)
-            if callable(close):
-                try:
-                    close()
-                except Exception:
-                    pass
-    except Exception as exc:
-        _error(f"gemini google-genai call failed: {type(exc).__name__}: {exc}")
+            from google import genai  # type: ignore
+
+            client = genai.Client(api_key=config.gemini_key)
+            try:
+                response = client.models.generate_content(model=model, contents=prompt)
+                text = (getattr(response, "text", None) or "").strip()
+                _trace(f"gemini genai.Client model={model} chars={len(text)}")
+                if text:
+                    return text
+                primary_error = "gemini google-genai returned an empty response"
+            finally:
+                close = getattr(client, "close", None)
+                if callable(close):
+                    try:
+                        close()
+                    except Exception:
+                        pass
+        except Exception as exc:
+            primary_error = f"gemini google-genai call failed: {type(exc).__name__}: {exc}"
+    else:
+        _trace("google-genai not installed; trying legacy google-generativeai")
 
     # Legacy: google-generativeai GenerativeModel API.
-    try:
-        import google.generativeai as legacy_genai  # type: ignore
+    if find_spec("google.generativeai") is not None:
+        try:
+            import google.generativeai as legacy_genai  # type: ignore
 
-        legacy_genai.configure(api_key=config.gemini_key)
-        response = legacy_genai.GenerativeModel(model).generate_content(prompt)
-        text = (getattr(response, "text", None) or "").strip()
-        _trace(f"gemini legacy GenerativeModel model={model} chars={len(text)}")
-        return text or None
-    except Exception as exc:
-        _error(f"gemini google-generativeai call failed: {type(exc).__name__}: {exc}")
-        return None
+            legacy_genai.configure(api_key=config.gemini_key)
+            response = legacy_genai.GenerativeModel(model).generate_content(prompt)
+            text = (getattr(response, "text", None) or "").strip()
+            _trace(f"gemini legacy GenerativeModel model={model} chars={len(text)}")
+            if text:
+                return text
+        except Exception as exc:
+            # Keep the primary error if we have one: it is the more informative of
+            # the two, since the primary SDK is the one normally installed.
+            primary_error = primary_error or f"gemini google-generativeai call failed: {type(exc).__name__}: {exc}"
+    else:
+        _trace("legacy google-generativeai not installed")
+
+    if primary_error:
+        _error(primary_error)
+    else:
+        _error("gemini: no usable SDK installed (need google-genai or google-generativeai)")
+    return None
 
 
 _JSON_ONLY_NUDGE = (
