@@ -1,80 +1,108 @@
+"""Critic agent: grades the published summary against the retrieved sources.
+
+Two properties matter here and both were previously wrong:
+
+* The critic reviews **the summary the user sees**. It calls
+  :func:`critique_with_provider` with that exact text rather than asking the model
+  for an independent second draft — grading a parallel draft says nothing about
+  what was published.
+* A model verdict of ``supported: false`` is **final**. Attaching evidence
+  snippets does not promote a claim to supported; that inversion pushed every
+  score toward 1.0 and made the number meaningless.
+
+:attr:`CriticVerdict.method` records whether an LLM or the keyword heuristic
+produced the score, so a caller can tell a verified 0.8 from a guessed one.
+"""
+
 from __future__ import annotations
 
-from app.models.schemas import ClaimCheck, SourceDocument
+from app.models.schemas import ClaimCheck, CriticVerdict, SourceDocument
+
+# Longest evidence snippet kept per claim, so a whole abstract cannot be pasted in.
+_MAX_SNIPPET_CHARS = 300
 
 
 class CriticAgent:
-    def invoke(self, summary: str, documents: list[SourceDocument]) -> tuple[float, list[ClaimCheck]]:
-        """Use an LLM provider to perform claim-checking when available, otherwise fall back to a lightweight heuristic."""
-        if not summary:
-            return 1.0, []
+    def invoke(
+        self,
+        summary: str,
+        documents: list[SourceDocument],
+        model_name: str | None = None,
+    ) -> CriticVerdict:
+        if not summary or not summary.strip():
+            return CriticVerdict(score=0.0, claim_checks=[], method="empty")
 
-        try:
-            from app.services.llm_provider import summarize_with_provider, try_parse_json_section
+        from app.services.llm_provider import critique_with_provider, parse_json_section
 
-            # ask the provider to return claim checks in the JSON section
-            raw = summarize_with_provider(None, documents)
-            _md, data = try_parse_json_section(raw)
-            checks: list[ClaimCheck] = []
-            claim_checks = data.get("claim_checks") or []
-            unsupported = 0
-            for item in claim_checks:
-                claim = item.get("claim") if isinstance(item, dict) else str(item)
-                evidence_idxs = item.get("evidence") if isinstance(item, dict) else []
-                evidence_snips = item.get("evidence_snippets") if isinstance(item, dict) else []
-                rationale = item.get("rationale") if isinstance(item, dict) else ""
+        raw = critique_with_provider(summary, documents, model_name=model_name)
+        _markdown, data = parse_json_section(raw)
 
-                evidence_list: list[str] = []
-                # map integer indices to source snippets/titles
-                if isinstance(evidence_idxs, list):
-                    for idx in evidence_idxs:
-                        try:
-                            if isinstance(idx, int) and 1 <= idx <= len(documents):
-                                doc = documents[idx - 1]
-                                title = getattr(doc, "title", "")
-                                snippet = getattr(doc, "abstract", None) or (getattr(doc, "content", "")[:200] if getattr(doc, "content", "") else "")
-                                evidence_list.append(f"[{idx}] {title} - {snippet}")
-                        except Exception:
-                            continue
-                # include any snippets returned by the provider
-                if isinstance(evidence_snips, list):
-                    for s in evidence_snips:
-                        try:
-                            if s and s not in evidence_list:
-                                evidence_list.append(s)
-                        except Exception:
-                            pass
+        if data.get("error") or "claim_checks" not in data:
+            return CriticVerdict(score=0.0, claim_checks=[], method="empty")
 
-                supported = bool(item.get("supported")) if isinstance(item, dict) else False
-                # treat presence of evidence as support
-                if evidence_list:
-                    supported = True
-                if not supported:
-                    unsupported += 1
-                checks.append(
-                    ClaimCheck(claim=claim, supported=supported, evidence=evidence_list or [], rationale=rationale or "")
+        checks = self._build_checks(data.get("claim_checks") or [], documents)
+        if not checks:
+            return CriticVerdict(score=0.0, claim_checks=[], method="empty")
+
+        # The provider stamps `method: heuristic` when no model produced the verdict.
+        method = "heuristic" if data.get("method") == "heuristic" else "llm"
+
+        supported = sum(1 for check in checks if check.supported)
+        return CriticVerdict(
+            score=round(supported / len(checks), 2),
+            claim_checks=checks,
+            method=method,
+        )
+
+    def _build_checks(self, raw_checks: list, documents: list[SourceDocument]) -> list[ClaimCheck]:
+        checks: list[ClaimCheck] = []
+        for item in raw_checks:
+            if not isinstance(item, dict):
+                # A bare string carries no verdict, so it cannot count as supported.
+                checks.append(ClaimCheck(claim=str(item), supported=False, rationale="No verdict returned for this claim."))
+                continue
+
+            claim = str(item.get("claim") or "").strip()
+            if not claim:
+                continue
+
+            evidence = self._resolve_evidence(item, documents)
+            checks.append(
+                ClaimCheck(
+                    claim=claim,
+                    # The model's verdict stands as given. Evidence is context for a
+                    # reader, never a reason to overturn `supported: false`.
+                    supported=bool(item.get("supported")),
+                    evidence=evidence,
+                    rationale=str(item.get("rationale") or ""),
                 )
+            )
+        return checks
 
-            score = 1.0 if not checks else round(1.0 - (unsupported / len(checks)), 2)
-            return score, checks
-        except Exception:
-            # fallback heuristic
-            claims = [line[2:].strip() for line in summary.splitlines() if line.startswith("- ")]
-            checks: list[ClaimCheck] = []
-            source_titles = {document.title.lower() for document in documents}
-            unsupported = 0
-            for claim in claims:
-                supported = any(token.lower() in source_titles for token in claim.split() if len(token) > 4)
-                if not supported:
-                    unsupported += 1
-                checks.append(
-                    ClaimCheck(
-                        claim=claim,
-                        supported=supported,
-                        evidence=[document.title for document in documents[:3]] if supported else [],
-                        rationale="Matched retrieved source titles" if supported else "No direct source evidence found in the retrieved set",
-                    )
-                )
+    def _resolve_evidence(self, item: dict, documents: list[SourceDocument]) -> list[str]:
+        """Turn 1-based source indices and model snippets into readable citations.
 
-            score = 1.0 if not claims else round(1.0 - (unsupported / len(claims)), 2)
-            return score, checks
+        Out-of-range indices are dropped rather than clamped: a model citing source
+        [9] of 5 has hallucinated a citation, and clamping would hide that.
+        """
+        evidence: list[str] = []
+
+        indices = item.get("evidence")
+        if isinstance(indices, list):
+            for index in indices:
+                if not isinstance(index, int) or not 1 <= index <= len(documents):
+                    continue
+                document = documents[index - 1]
+                snippet = (document.abstract or document.content or "")[:200].replace("\n", " ").strip()
+                citation = f"[{index}] {document.title}" + (f" — {snippet}" if snippet else "")
+                if citation not in evidence:
+                    evidence.append(citation)
+
+        snippets = item.get("evidence_snippets")
+        if isinstance(snippets, list):
+            for snippet in snippets:
+                text = str(snippet).strip()[:_MAX_SNIPPET_CHARS]
+                if text and text not in evidence:
+                    evidence.append(text)
+
+        return evidence

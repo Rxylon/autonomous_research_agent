@@ -1,3 +1,21 @@
+"""LLM provider abstraction for the summarizer and critic agents.
+
+Two public entry points:
+
+* :func:`summarize_with_provider` — synthesises retrieved sources into a Markdown
+  summary followed by a ``===JSON===`` block of claim checks.
+* :func:`critique_with_provider` — grades an *already written* summary against the
+  retrieved sources and returns only the ``===JSON===`` claim-check block.
+
+Both are synchronous and blocking. Callers on an event loop must offload them to a
+worker thread (``asyncio.to_thread``); ``app.graph.workflow`` does this for every
+node so the WebSocket handler never stalls.
+
+Both degrade to a deterministic local fallback when no provider is configured, no
+API key is present, or every provider call fails. The fallback is always labelled
+as such so a reader can tell a real model run from a stub.
+"""
+
 from __future__ import annotations
 
 import ast
@@ -5,428 +23,447 @@ import json
 import os
 import re
 import time
-from typing import Any, Dict, List, Tuple
+from dataclasses import dataclass
+from typing import Any, Callable, List
 
 from app.core.config import settings
 
+JSON_MARKER = "===JSON==="
 
-def _prepare_snippets(documents: List[Any], max_chars: int = 800) -> str:
+_LOGS_DIR = os.path.join(
+    os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")), "logs"
+)
+
+# Text the local fallback stamps into its claim check so downstream consumers
+# (and the reader of a report) can tell it apart from a real model verdict.
+FALLBACK_CLAIM = "Summary produced by the local deterministic fallback (no LLM provider was used)"
+
+
+# Most recent provider failure, surfaced by GET /health.
+#
+# This exists because "a key is set" and "the provider works" are different states,
+# and the gap between them is invisible: an invalid or rate-limited key makes every
+# summary come from the local fallback while health still reports configured. Without
+# this, diagnosing a deployment means reading log files on the host.
+_last_error: str | None = None
+
+
+def last_provider_error() -> str | None:
+    return _last_error
+
+
+def _log(filename: str, message: str) -> None:
+    """Best-effort append to backend/logs/<filename>. Never raises."""
+    try:
+        os.makedirs(_LOGS_DIR, exist_ok=True)
+        with open(os.path.join(_LOGS_DIR, filename), "a", encoding="utf-8") as handle:
+            handle.write(message.rstrip("\n") + "\n")
+    except Exception:
+        pass
+
+
+def _trace(message: str) -> None:
+    _log("llm_provider_trace.log", message)
+
+
+def _error(message: str) -> None:
+    global _last_error
+    _last_error = message[:500]
+    _log("llm_provider_errors.log", message)
+
+
+@dataclass(frozen=True)
+class ProviderConfig:
+    provider: str
+    model: str
+    openai_key: str | None
+    gemini_key: str | None
+
+    @property
+    def usable(self) -> bool:
+        if self.provider == "openai":
+            return bool(self.openai_key)
+        if self.provider == "gemini":
+            return bool(self.gemini_key)
+        return False
+
+
+def resolve_provider_config(model_name: str | None = None) -> ProviderConfig:
+    """Read provider settings, preferring live environment variables over the
+    cached ``settings`` snapshot so tests can override them at runtime."""
+    provider = (os.getenv("DEFAULT_LLM_PROVIDER") or settings.default_llm_provider or "mock").strip().lower()
+    model = (model_name or os.getenv("DEFAULT_LLM_MODEL") or settings.default_llm_model or "").strip()
+
+    if not model:
+        model = "gpt-4o-mini" if provider == "openai" else "gemini-2.0-flash"
+
+    config = ProviderConfig(
+        provider=provider,
+        model=model,
+        openai_key=os.getenv("OPENAI_API_KEY") or settings.openai_api_key,
+        gemini_key=os.getenv("GEMINI_API_KEY") or settings.gemini_api_key,
+    )
+    _trace(
+        f"resolve provider={config.provider} model={config.model} "
+        f"openai_key_set={bool(config.openai_key)} gemini_key_set={bool(config.gemini_key)}"
+    )
+    return config
+
+
+def _prepare_snippets(documents: List[Any], max_chars: int = 800, max_documents: int = 8) -> str:
+    """Render documents as a numbered source list the model can cite by index."""
     parts = []
-    for i, doc in enumerate(documents[:8], start=1):
-        title = getattr(doc, "title", "")
-        url = getattr(doc, "url", None) or ""
-        abstract = getattr(doc, "abstract", None) or ""
-        content = getattr(doc, "content", "") or ""
-        snippet = abstract or (content[:max_chars] if content else "")
-        # include an explicit index, title, url, and short snippet
-        parts.append(f"[{i}] {title}\nURL: {url}\nSnippet: {snippet}\n")
+    for index, document in enumerate(documents[:max_documents], start=1):
+        title = getattr(document, "title", "") or ""
+        url = getattr(document, "url", None) or ""
+        abstract = getattr(document, "abstract", None) or ""
+        content = getattr(document, "content", "") or ""
+        snippet = (abstract or content)[:max_chars]
+        parts.append(f"[{index}] {title}\nURL: {url}\nSnippet: {snippet}\n")
     return "\n".join(parts)
 
 
-def summarize_with_provider(plan: Any, documents: List[Any], model_name: str | None = None) -> str:
-    try:
-        model = model_name or os.getenv("DEFAULT_LLM_MODEL") or "gpt-3.5-turbo"
-        # prefer runtime environment variables (tests may load .env at runtime)
-        provider = os.getenv("DEFAULT_LLM_PROVIDER") or settings.default_llm_provider or "mock"
-        openai_key = os.getenv("OPENAI_API_KEY") or settings.openai_api_key
-        gemini_key = os.getenv("GEMINI_API_KEY") or settings.gemini_api_key
-        # determine repository logs directory (absolute) and trace runtime resolution
-        project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-        logs_dir = os.path.join(project_root, "logs")
+def parse_json_section(text: str) -> tuple[str, dict]:
+    """Split ``text`` at the ``===JSON===`` marker and parse the JSON half.
+
+    Returns ``(markdown, data)``. ``data`` is ``{}`` when no JSON could be located,
+    or ``{"error": "failed_to_parse_json", ...}`` when a candidate was found but
+    would not parse — callers must check for that key before trusting the payload.
+    """
+    if not text:
+        return "", {}
+
+    def _loads(candidate: str) -> dict | None:
+        candidate = candidate.strip()
+        # Models often wrap JSON in a ```json fence despite instructions.
+        fenced = re.search(r"```(?:json)?\s*([\s\S]*?)```", candidate)
+        if fenced:
+            candidate = fenced.group(1).strip()
         try:
-            os.makedirs(logs_dir, exist_ok=True)
-            with open(os.path.join(logs_dir, "llm_provider_trace.log"), "a", encoding="utf-8") as fh:
-                fh.write(f"ENTRY provider={provider} openai_key_set={bool(openai_key)} gemini_key_set={bool(gemini_key)} model={model}\n")
+            return json.loads(candidate)
         except Exception:
             pass
+        match = re.search(r"(\{[\s\S]*\}|\[[\s\S]*\])", candidate)
+        if match:
+            trimmed = match.group(1)
+            try:
+                return json.loads(trimmed)
+            except Exception:
+                try:
+                    # Tolerate Python literals (True/False/None, single quotes).
+                    return json.loads(json.dumps(ast.literal_eval(trimmed)))
+                except Exception:
+                    return None
+        return None
+
+    if JSON_MARKER in text:
+        markdown, _, json_text = text.partition(JSON_MARKER)
+        data = _loads(json_text)
+        if data is None:
+            return markdown.strip(), {"error": "failed_to_parse_json", "raw": json_text.strip()}
+        return markdown.strip(), data
+
+    # No marker: fall back to the last JSON object in the text.
+    match = re.search(r"(\{[\s\S]*\})\s*$", text)
+    if match:
+        data = _loads(match.group(1))
+        if data is None:
+            return text.strip(), {"error": "failed_to_parse_json", "raw": match.group(1)}
+        return text[: match.start()].strip(), data
+
+    return text.strip(), {}
+
+
+# Kept as the historical public name used by the agents.
+try_parse_json_section = parse_json_section
+
+
+def _has_usable_json(text: str | None) -> bool:
+    if not text:
+        return False
+    _markdown, data = parse_json_section(text)
+    return bool(data) and not data.get("error")
+
+
+# --------------------------------------------------------------------------- #
+# Provider calls
+# --------------------------------------------------------------------------- #
+
+
+def _call_openai(prompt: str, config: ProviderConfig) -> str | None:
+    """Call the OpenAI Chat Completions API using the v1+ SDK surface."""
+    try:
+        from openai import OpenAI
     except Exception as exc:
-        # if we fail to even determine config, log to stderr and fall back to mock
-        print(f"Error determining LLM provider configuration: {type(exc).__name__}: {exc}")
-        provider = "mock"
+        _error(f"openai SDK unavailable: {type(exc).__name__}: {exc}")
+        return None
 
-    prompt = (
-        "You are a careful research assistant. Given the research objective and a set of numbered source snippets, produce the following OUTPUT STRICTLY and in this order:\n"
-        "\n1) A short Markdown summary (3-6 bullet points) that synthesizes main approaches, findings, and open problems.\n"
-        "\n2) A JSON object delimited by a single line containing exactly ===JSON=== (three equal signs, no extra text) on its own line, followed immediately by the JSON text and nothing else. The JSON must be a single top-level object with the key `claim_checks` whose value is an array of objects. Each claim object must have the fields: `claim` (string), `supported` (true/false), `evidence` (array of integer source indices referencing the numbered Sources above), `evidence_snippets` (array of short strings drawn from the cited sources), and `rationale` (string).\n"
-        "\nIMPORTANT: Use only the source indices present in the Sources list. Do not invent sources. If you cannot find direct supporting evidence for a claim, set `supported` to false and set `evidence` to an empty array.\n"
-        "\nAlways follow the marker format exactly: produce the Markdown summary, then a line with ===JSON===, then the JSON object only.\n\n"
-    )
+    try:
+        client = OpenAI(api_key=config.openai_key)
+        response = client.chat.completions.create(
+            model=config.model,
+            messages=[
+                {"role": "system", "content": "You are a careful research summarisation assistant."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.0,
+            max_tokens=1600,
+        )
+        text = (response.choices[0].message.content or "").strip()
+        _trace(f"openai chat.completions model={config.model} chars={len(text)}")
+        return text or None
+    except Exception as exc:
+        _error(f"openai call failed: {type(exc).__name__}: {exc}")
+        return None
 
-    snippets = _prepare_snippets(documents)
-    objective = getattr(plan, "objective", str(plan)) if plan else ""
 
-    # if using Gemini and no Gemini-specific model was provided, prefer a Gemini model
-    if provider == "gemini" and (not model or model == "gpt-3.5-turbo"):
-        model = os.getenv("DEFAULT_LLM_MODEL") or "models/gemini-1.0"
+def _gemini_model_name(model: str) -> str:
+    """google-genai accepts either ``gemini-2.0-flash`` or ``models/gemini-2.0-flash``.
 
-    full_prompt = (
-        f"Research objective:\n{objective}\n\nSources:\n{snippets}\n\nInstruction:\n{prompt}"
-    )
+    Normalise to the bare name, which both the current and legacy SDKs accept.
+    """
+    return model[len("models/") :] if model.startswith("models/") else model
 
-    def _extract_json(text: str) -> tuple[str, dict]:
-        marker = "===JSON==="
-        if marker in text:
-            parts = text.split(marker, 1)
-            md = parts[0].strip()
-            json_text = parts[1].strip()
-            # try strict json first
-            try:
-                data = json.loads(json_text)
-                return md, data
-            except Exception:
-                # attempt tolerant parse using ast.literal_eval after some cleanup
-                cleaned = json_text.strip()
-                # remove leading/trailing non-json
-                m = re.search(r"(\{.*\}|\[.*\])", cleaned, re.S)
-                if m:
-                    cleaned = m.group(1)
-                try:
-                    data = ast.literal_eval(cleaned)
-                    # convert Python literals to JSON-serializable dict
-                    json_str = json.dumps(data)
-                    data = json.loads(json_str)
-                    return md, data
-                except Exception:
-                    return md, {"error": "failed_to_parse_json", "raw": json_text}
-        # no marker
-        # also try to find a JSON object at end of text
-        m = re.search(r"(\{[\s\S]*\})\s*$", text)
-        if m:
-            md = text[: m.start()].strip()
-            json_text = m.group(1)
-            try:
-                data = json.loads(json_text)
-                return md, data
-            except Exception:
-                try:
-                    data = ast.literal_eval(json_text)
-                    json_str = json.dumps(data)
-                    data = json.loads(json_str)
-                    return md, data
-                except Exception:
-                    return text, {"error": "failed_to_parse_json", "raw": json_text}
-        return text, {}
 
-    # helper to request only JSON if the full response failed to include valid JSON
-    def _request_json_only_openai(chat_messages: list[dict], attempts: int = 1) -> str | None:
+def _call_gemini(prompt: str, config: ProviderConfig) -> str | None:
+    """Call Gemini via google-genai (preferred) or the legacy google-generativeai."""
+    model = _gemini_model_name(config.model)
+
+    # Preferred: google-genai >= 1.0 Client API.
+    try:
+        from google import genai  # type: ignore
+
+        client = genai.Client(api_key=config.gemini_key)
         try:
-            import openai
-            openai.api_key = settings.openai_api_key
-            followup = (
-                "The previous response did not contain a valid JSON object.\n"
-                "Strictly respond with exactly one line that starts with ===JSON=== followed by the JSON object and nothing else. No markdown, no explanation."
-            )
-            for i in range(max(1, attempts)):
-                messages = chat_messages + [{"role": "user", "content": followup}]
+            response = client.models.generate_content(model=model, contents=prompt)
+            text = (getattr(response, "text", None) or "").strip()
+            _trace(f"gemini genai.Client model={model} chars={len(text)}")
+            if text:
+                return text
+        finally:
+            close = getattr(client, "close", None)
+            if callable(close):
                 try:
-                    resp = openai.ChatCompletion.create(
-                        model=model,
-                        messages=messages,
-                        temperature=0.0,
-                        max_tokens=1200,
-                    )
-                    text = resp["choices"][0]["message"]["content"].strip()
-                    # quick validation
-                    if "===JSON===" in text or re.search(r"\{[\s\S]*\}", text):
-                        return text
+                    close()
                 except Exception:
                     pass
-                # exponential backoff small sleep
-                time.sleep(min(2 ** i, 4))
-            return None
-        except Exception:
-            return None
+    except Exception as exc:
+        _error(f"gemini google-genai call failed: {type(exc).__name__}: {exc}")
 
-    def _request_json_only_gemini(base_prompt: str, attempts: int = 2) -> str | None:
-        try:
-            # prefer the new package name if available, fall back to the deprecated one
-            try:
-                import google.genai as genai
-            except Exception:
-                import google.generativeai as genai
+    # Legacy: google-generativeai GenerativeModel API.
+    try:
+        import google.generativeai as legacy_genai  # type: ignore
 
-            # configure client
-            try:
-                genai.configure(api_key=settings.gemini_api_key)
-            except Exception:
-                # some genai variants may not expose configure; set environment variable instead
-                os.environ.setdefault("GEMINI_API_KEY", settings.gemini_api_key)
-            followup = (
-                "The previous response did not contain a valid JSON object.\n"
-                "Please respond with exactly one line containing ===JSON=== followed by the JSON object only (no markdown, no explanation)."
-            )
-            chosen_model = model
-            if not chosen_model.startswith("models/"):
-                chosen_model = f"models/{chosen_model}" if not chosen_model.startswith("gemini") else f"models/{chosen_model}"
+        legacy_genai.configure(api_key=config.gemini_key)
+        response = legacy_genai.GenerativeModel(model).generate_content(prompt)
+        text = (getattr(response, "text", None) or "").strip()
+        _trace(f"gemini legacy GenerativeModel model={model} chars={len(text)}")
+        return text or None
+    except Exception as exc:
+        _error(f"gemini google-generativeai call failed: {type(exc).__name__}: {exc}")
+        return None
 
-            # Prefer the `Client` API if available (google.genai>=2.x)
-            genai_dir = dir(genai)
-            attempts = []
 
-            def _extract_text_from_resp(resp):
-                if resp is None:
-                    return ""
-                if isinstance(resp, str):
-                    return resp
-                for attr in ("text", "result", "output", "data"):
-                    if hasattr(resp, attr):
-                        val = getattr(resp, attr)
-                        if isinstance(val, str):
-                            return val
-                        try:
-                            if isinstance(val, (list, tuple)) and len(val) > 0:
-                                first = val[0]
-                                if isinstance(first, str):
-                                    return first
-                                if hasattr(first, "text"):
-                                    return first.text
-                                if hasattr(first, "content"):
-                                    return first.content
-                        except Exception:
-                            pass
-                        try:
-                            if isinstance(val, dict) and "text" in val:
-                                return val["text"]
-                        except Exception:
-                            pass
-                try:
-                    return str(resp)
-                except Exception:
-                    return ""
+_JSON_ONLY_NUDGE = (
+    "\n\nYour previous response did not contain a parseable JSON object. "
+    f"Respond again with a line containing exactly {JSON_MARKER} followed by the JSON object "
+    "and nothing else. No prose, no markdown code fences."
+)
 
-            # Try to instantiate the genai Client with the API key and call models.generate_content
-            try:
-                ClientClass = getattr(genai, 'Client', None) or getattr(getattr(genai, 'client', {}), 'Client', None)
-                if ClientClass:
-                    try:
-                        client = ClientClass(api_key=settings.gemini_api_key)
-                    except Exception:
-                        # fallback: try passing api_key as positional or via environment
-                        os.environ.setdefault('GEMINI_API_KEY', settings.gemini_api_key)
-                        client = ClientClass()
-                    try:
-                        if hasattr(client, 'models') and hasattr(client.models, 'generate_content'):
-                            resp = client.models.generate_content(model=chosen_model, contents=base_prompt + "\n\n" + followup)
-                            text = _extract_text_from_resp(getattr(resp, 'text', resp))
-                            attempts.append(('client.models.generate_content', 'ok'))
-                            try:
-                                os.makedirs(logs_dir, exist_ok=True)
-                                with open(os.path.join(logs_dir, "llm_provider_trace.log"), "a", encoding="utf-8") as fh:
-                                    fh.write(f"Gemini used client.models.generate_content resp_type={type(resp)}\n")
-                            except Exception:
-                                pass
-                            try:
-                                client.close()
-                            except Exception:
-                                pass
-                            return text
-                    except Exception as exc:
-                        attempts.append(('client.models.generate_content', f'exc:{type(exc).__name__}'))
-                        try:
-                            os.makedirs(logs_dir, exist_ok=True)
-                            with open(os.path.join(logs_dir, "llm_provider_errors.log"), "a", encoding="utf-8") as fh:
-                                fh.write(f"Gemini client.models.generate_content failed: {type(exc).__name__}: {exc}\n")
-                        except Exception:
-                            pass
 
-            except Exception:
-                pass
+def _generate(prompt: str, config: ProviderConfig, attempts: int = 2) -> str | None:
+    """Call the configured provider, retrying with a JSON-only nudge if needed.
 
-            # Fallback: try legacy top-level procedural call surfaces we might have missed
-            # (keep previous defensive attempts for broad compatibility)
-            call_candidates = [
-                ("generate_text", lambda: genai.generate_text(model=chosen_model, prompt=base_prompt + "\n\n" + followup, temperature=0.0) if hasattr(genai, "generate_text") else None),
-                ("Text.generate", lambda: genai.Text.generate(model=chosen_model, prompt=base_prompt + "\n\n" + followup, temperature=0.0) if hasattr(genai, "Text") and hasattr(genai.Text, "generate") else None),
-                ("generate", lambda: genai.generate(model=chosen_model, prompt=base_prompt + "\n\n" + followup, temperature=0.0) if hasattr(genai, "generate") else None),
-                ("chat.create", lambda: genai.chat.create(model=chosen_model, messages=[{"role": "user", "content": base_prompt + "\n\n" + followup}], temperature=0.0) if hasattr(genai, "chat") and hasattr(genai.chat, "create") else None),
-                ("chats.create", lambda: genai.chats.create(model=chosen_model, messages=[{"role": "user", "content": base_prompt + "\n\n" + followup}], temperature=0.0) if hasattr(genai, "chats") and hasattr(genai.chats, "create") else None),
-            ]
+    ``attempts`` is the total number of calls, so the default of 2 means one
+    initial call plus one retry.
+    """
+    if not config.usable:
+        _trace(f"provider {config.provider!r} not usable (missing key or mock) — using local fallback")
+        return None
 
-            # Try multiple passes of fallback call candidates to increase robustness
-            for attempt_index in range(max(1, attempts)):
-                for name, fn in call_candidates:
-                    try:
-                        if fn is None:
-                            attempts.append((name, "not_available"))
-                            continue
-                        resp = fn()
-                        text = _extract_text_from_resp(resp)
-                        attempts.append((name, "ok"))
-                        try:
-                            os.makedirs(logs_dir, exist_ok=True)
-                            with open(os.path.join(logs_dir, "llm_provider_trace.log"), "a", encoding="utf-8") as fh:
-                                fh.write(f"Gemini used method={name} resp_type={type(resp)} attempt={attempt_index}\n")
-                        except Exception:
-                            pass
-                        # quick validation
-                        if text and ("===JSON===" in text or re.search(r"\{[\s\S]*\}", text)):
-                            return text
-                    except Exception as exc:
-                        attempts.append((name, f"exc:{type(exc).__name__}"))
-                        try:
-                            os.makedirs(logs_dir, exist_ok=True)
-                            with open(os.path.join(logs_dir, "llm_provider_errors.log"), "a", encoding="utf-8") as fh:
-                                fh.write(f"Gemini attempt {name} failed: {type(exc).__name__}: {exc}\n")
-                        except Exception:
-                            pass
-                # small backoff between outer attempts
-                time.sleep(min(1 * (attempt_index + 1), 4))
-
-            try:
-                os.makedirs(logs_dir, exist_ok=True)
-                with open(os.path.join(logs_dir, "llm_provider_errors.log"), "a", encoding="utf-8") as fh:
-                    fh.write(f"Gemini all attempts failed. genai_dir={genai_dir} attempts={attempts}\n")
-            except Exception:
-                pass
-            return None
-        except Exception:
-            return None
-
-    # Try OpenAI first
-    if provider == "openai" and openai_key:
-        try:
-            import openai
-
-            openai.api_key = openai_key
-            messages = [
-                {"role": "system", "content": "You are a helpful research summarization assistant."},
-                {"role": "user", "content": full_prompt},
-            ]
-            resp = openai.ChatCompletion.create(
-                model=model,
-                messages=messages,
-                temperature=0.0,
-                max_tokens=1200,
-            )
-            try:
-                os.makedirs(logs_dir, exist_ok=True)
-                with open(os.path.join(logs_dir, "llm_provider_trace.log"), "a", encoding="utf-8") as fh:
-                    fh.write(f"OpenAI call model={model} resp_keys={list(resp.keys())}\n")
-            except Exception:
-                pass
-            text = resp["choices"][0]["message"]["content"].strip()
-            md, parsed = _extract_json(text)
-            # if parsing failed, try one follow-up asking for JSON only
-            if parsed and not parsed.get("error"):
-                return text
-            follow = _request_json_only_openai(messages)
-            if follow:
-                # combine markdown from earlier with follow-up JSON if possible
-                _, parsed2 = _extract_json(follow)
-                if parsed2 and not parsed2.get("error"):
-                    # ensure we return markdown + marker + json
-                    return md + "\n\n===JSON===\n" + json.dumps(parsed2)
-            return text
-        except Exception as exc:
-            try:
-                os.makedirs(logs_dir, exist_ok=True)
-                with open(os.path.join(logs_dir, "llm_provider_errors.log"), "a", encoding="utf-8") as fh:
-                    fh.write(f"OpenAI call failed: {type(exc).__name__}: {exc}\n")
-            except Exception:
-                pass
-
-    # Try Gemini (google generative ai) if configured
-    if provider == "gemini" and gemini_key:
-        try:
-            # prefer the new package name if available
-            try:
-                import google.genai as genai
-            except Exception:
-                import google.generativeai as genai
-
-            # try to use the high-level Client API when present
-            chosen_model = model
-            if not chosen_model.startswith("models/"):
-                chosen_model = f"models/{chosen_model}" if not chosen_model.startswith("gemini") else f"models/{chosen_model}"
-            try:
-                os.makedirs(logs_dir, exist_ok=True)
-                with open(os.path.join(logs_dir, "llm_provider_trace.log"), "a", encoding="utf-8") as fh:
-                    fh.write(f"Gemini call model={chosen_model}\n")
-            except Exception:
-                pass
-
-            genai_dir = dir(genai)
-            text = ""
-            # If the Client class is available we should instantiate with the API key
-            ClientClass = getattr(genai, 'Client', None) or getattr(getattr(genai, 'client', {}), 'Client', None)
-            if ClientClass:
-                try:
-                    client = ClientClass(api_key=gemini_key)
-                except Exception:
-                    os.environ.setdefault('GEMINI_API_KEY', gemini_key)
-                    client = ClientClass()
-                try:
-                    if hasattr(client, 'models') and hasattr(client.models, 'generate_content'):
-                        resp = client.models.generate_content(model=chosen_model, contents=full_prompt)
-                        text = getattr(resp, 'text', str(resp))
-                        try:
-                            os.makedirs(logs_dir, exist_ok=True)
-                            with open(os.path.join(logs_dir, "llm_provider_trace.log"), "a", encoding="utf-8") as fh:
-                                fh.write(f"Gemini used client.models.generate_content resp_type={type(resp)}\n")
-                        except Exception:
-                            pass
-                    try:
-                        client.close()
-                    except Exception:
-                        pass
-                except Exception as exc:
-                    try:
-                        with open(os.path.join(logs_dir, "llm_provider_errors.log"), "a", encoding="utf-8") as fh:
-                            fh.write(f"Gemini client.models.generate_content failed: {type(exc).__name__}: {exc}\n")
-                    except Exception:
-                        pass
-
-            # If we didn't get text yet, fall back to the more defensive follow-up path
-            md, parsed = _extract_json(text)
-            if parsed and not parsed.get("error"):
-                return text
-            follow = _request_json_only_gemini(full_prompt)
-            if follow:
-                _, parsed2 = _extract_json(follow)
-                if parsed2 and not parsed2.get("error"):
-                    return md + "\n\n===JSON===\n" + json.dumps(parsed2)
-            return text
-        except Exception as exc:
-            try:
-                os.makedirs(logs_dir, exist_ok=True)
-                with open(os.path.join(logs_dir, "llm_provider_errors.log"), "a", encoding="utf-8") as fh:
-                    fh.write(f"Gemini call failed: {type(exc).__name__}: {exc}\n")
-            except Exception:
-                pass
-            # fall through to fallback
-            pass
-
-    # Fallback: local deterministic summary
-    bullets = []
-    if documents:
-        titles = [getattr(d, "title", "") for d in documents[:6]]
-        bullets.append(f"Research objective: {objective}")
-        bullets.append(f"Retrieved {len(documents)} source documents from sources: {', '.join(sorted({getattr(d, 'source', 'unknown') for d in documents}))}.")
-        bullets.append("Major themes to investigate: - transformer-based fusion; - temporal modeling; - modality alignment; - robustness and dataset bias.")
-        bullets.append("Representative sources: " + ", ".join(titles))
-    else:
-        bullets.append("No documents retrieved.")
-
-    md = "\n".join(bullets)
-    # include a trivial JSON claim-checks placeholder
-    placeholder = {
-        "claim_checks": [
-            {"claim": "Summary produced by local fallback", "supported": False, "evidence": [], "rationale": "No LLM provider configured"}
-        ]
+    callers: dict[str, Callable[[str, ProviderConfig], str | None]] = {
+        "openai": _call_openai,
+        "gemini": _call_gemini,
     }
-    return md + "\n\n===JSON===\n" + json.dumps(placeholder)
+    call = callers.get(config.provider)
+    if call is None:
+        _trace(f"unknown provider {config.provider!r} — using local fallback")
+        return None
+
+    best: str | None = None
+    for attempt in range(max(1, attempts)):
+        current_prompt = prompt if attempt == 0 else prompt + _JSON_ONLY_NUDGE
+        text = call(current_prompt, config)
+        if text:
+            best = best or text
+            if _has_usable_json(text):
+                return text
+            _trace(f"attempt {attempt} returned text without usable JSON")
+        if attempt + 1 < max(1, attempts):
+            time.sleep(min(2**attempt, 4))
+
+    # Return whatever prose we got: the caller still shows it, and the JSON
+    # section simply comes back empty rather than pretending to be verified.
+    return best
 
 
-def try_parse_json_section(text: str) -> tuple[str, dict]:
-    """If text contains ===JSON=== marker, split and parse the JSON part."""
-    marker = "===JSON==="
-    if marker in text:
-        parts = text.split(marker, 1)
-        md = parts[0].strip()
-        json_text = parts[1].strip()
-        try:
-            data = json.loads(json_text)
-        except Exception:
-            data = {"error": "failed_to_parse_json", "raw": json_text}
-        return md, data
-    return text, {}
+# --------------------------------------------------------------------------- #
+# Prompts
+# --------------------------------------------------------------------------- #
+
+_CLAIM_SCHEMA = (
+    "The JSON must be a single top-level object with the key `claim_checks` whose value is an "
+    "array of objects. Each object must have: `claim` (string), `supported` (true/false), "
+    "`evidence` (array of integer source indices from the numbered Sources above), "
+    "`evidence_snippets` (array of short verbatim strings from those cited sources), and "
+    "`rationale` (string).\n"
+    "Use only source indices that appear in the Sources list. Never invent a source. If you "
+    "cannot find direct supporting evidence for a claim, set `supported` to false and leave "
+    "`evidence` as an empty array."
+)
+
+
+def _summarize_prompt(objective: str, snippets: str) -> str:
+    return (
+        f"Research objective:\n{objective}\n\n"
+        f"Sources:\n{snippets}\n\n"
+        "Instruction:\n"
+        "You are a careful research assistant. Using ONLY the numbered sources above, produce "
+        "exactly two parts in this order:\n\n"
+        "1) A short Markdown summary (3-6 bullet points) synthesising the main approaches, "
+        "findings, and open problems.\n\n"
+        f"2) A line containing exactly {JSON_MARKER} on its own, followed immediately by a JSON "
+        "object and nothing else. Extract the claims you made in part 1 and check each one. "
+        f"{_CLAIM_SCHEMA}\n"
+    )
+
+
+def _critique_prompt(summary: str, snippets: str) -> str:
+    return (
+        f"Sources:\n{snippets}\n\n"
+        f"Summary under review:\n{summary}\n\n"
+        "Instruction:\n"
+        "You are a strict fact-checker. Break the summary under review into its individual "
+        "factual claims, then verify each claim against the numbered sources above. Judge only "
+        "what the sources actually support — do not use outside knowledge, and do not give a "
+        "claim the benefit of the doubt.\n\n"
+        f"Respond with a line containing exactly {JSON_MARKER} followed by a JSON object and "
+        f"nothing else. {_CLAIM_SCHEMA}\n"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Local fallbacks
+# --------------------------------------------------------------------------- #
+
+
+def _fallback_summary(objective: str, documents: List[Any]) -> str:
+    if not documents:
+        markdown = "- No source documents were retrieved for this objective."
+    else:
+        sources = sorted({getattr(document, "source", "unknown") for document in documents})
+        years = sorted({y for y in (getattr(d, "year", None) for d in documents) if y})
+        lines = [
+            f"- Research objective: {objective}",
+            f"- Retrieved {len(documents)} source documents from: {', '.join(sources)}.",
+        ]
+        if years:
+            lines.append(f"- Publication years observed: {years[0]}–{years[-1]}.")
+        lines.append(
+            "- No LLM provider is configured, so this listing is mechanical: it reports what "
+            "was retrieved without synthesising it."
+        )
+        lines.append("- Representative sources:")
+        lines.extend(f"  - {getattr(document, 'title', 'Untitled')}" for document in documents[:6])
+        markdown = "\n".join(lines)
+
+    placeholder = {
+        # Consumers key off this to label the run as unverified rather than
+        # inferring it from the text.
+        "method": "heuristic",
+        "claim_checks": [
+            {
+                "claim": FALLBACK_CLAIM,
+                "supported": False,
+                "evidence": [],
+                "evidence_snippets": [],
+                "rationale": "No LLM provider was configured, so no claim was verified.",
+            }
+        ],
+    }
+    return markdown + f"\n\n{JSON_MARKER}\n" + json.dumps(placeholder)
+
+
+def _fallback_claim_checks(summary: str, documents: List[Any]) -> str:
+    """Heuristic critique: match summary bullets against source titles.
+
+    Deliberately conservative — a keyword overlap is weak evidence, so the
+    rationale says so rather than claiming verification.
+    """
+    bullets = [
+        line.lstrip("-* ").strip()
+        for line in (summary or "").splitlines()
+        if line.strip().startswith(("-", "*"))
+    ]
+    title_tokens = {
+        token.lower()
+        for document in documents
+        for token in re.findall(r"\w+", getattr(document, "title", "") or "")
+        if len(token) > 4
+    }
+
+    checks = []
+    for bullet in bullets:
+        tokens = {t.lower() for t in re.findall(r"\w+", bullet) if len(t) > 4}
+        overlap = sorted(tokens & title_tokens)
+        checks.append(
+            {
+                "claim": bullet,
+                "supported": bool(overlap),
+                "evidence": [],
+                "evidence_snippets": overlap[:5],
+                "rationale": (
+                    f"Heuristic keyword overlap with retrieved source titles ({', '.join(overlap[:5])}). "
+                    "This is a weak signal, not model verification."
+                    if overlap
+                    else "No keyword overlap with any retrieved source title."
+                ),
+            }
+        )
+    return f"{JSON_MARKER}\n" + json.dumps({"method": "heuristic", "claim_checks": checks})
+
+
+# --------------------------------------------------------------------------- #
+# Public API
+# --------------------------------------------------------------------------- #
+
+
+def summarize_with_provider(plan: Any, documents: List[Any], model_name: str | None = None) -> str:
+    """Return ``markdown + ===JSON=== + claim_checks`` for the retrieved documents."""
+    objective = ""
+    if plan is not None:
+        objective = getattr(plan, "objective", None) or str(plan)
+
+    snippets = _prepare_snippets(documents)
+    config = resolve_provider_config(model_name)
+
+    text = _generate(_summarize_prompt(objective, snippets), config)
+    if text:
+        return text
+    return _fallback_summary(objective, documents)
+
+
+def critique_with_provider(summary: str, documents: List[Any], model_name: str | None = None) -> str:
+    """Grade ``summary`` — the exact text the user sees — against ``documents``.
+
+    Returns a ``===JSON===`` block of claim checks. This is a separate call from
+    :func:`summarize_with_provider` on purpose: the critic must review the summary
+    that was actually published, not an independently redrafted one.
+    """
+    snippets = _prepare_snippets(documents)
+    config = resolve_provider_config(model_name)
+
+    text = _generate(_critique_prompt(summary, snippets), config)
+    if text and _has_usable_json(text):
+        return text
+    return _fallback_claim_checks(summary, documents)
