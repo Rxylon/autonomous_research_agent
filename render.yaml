@@ -6,10 +6,23 @@ services:
     dockerfilePath: backend/Dockerfile
     plan: free
     region: ohio
+    healthCheckPath: /health
     envVars:
       - key: DEFAULT_LLM_PROVIDER
         value: gemini
+      - key: DEFAULT_LLM_MODEL
+        value: gemini-2.0-flash
       - key: GEMINI_API_KEY
-        sync: false # Requires manual entry in Render Dashboard
+        sync: false # Set in the Render dashboard; never commit a key.
+
+      # The free plan gives 512 MB RAM. Loading torch plus a Sentence-Transformers
+      # model needs several hundred MB on top of the app itself, so `auto` tends to
+      # OOM or thrash here. Pinning `hash` makes the tier deterministic: retrieval
+      # still works, but matching is lexical rather than semantic.
+      # Use `auto` on any host with >= 2 GB.
+      - key: EMBEDDING_BACKEND
+        value: hash
+
+      # Must list every browser origin that will call this service.
       - key: CORS_ORIGINS
-        value: https://research-ai-assistant-e5306.web.app
+        value: https://research-ai-assistant-e5306.web.app,http://localhost:3000

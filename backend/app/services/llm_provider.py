@@ -36,7 +36,7 @@ _LOGS_DIR = os.path.join(
 
 # Text the local fallback stamps into its claim check so downstream consumers
 # (and the reader of a report) can tell it apart from a real model verdict.
-FALLBACK_CLAIM = "Summary produced by the local deterministic fallback (no LLM provider was used)"
+FALLBACK_CLAIM = "Summary produced by the local deterministic fallback (no LLM was used)"
 
 
 # Most recent provider failure, surfaced by GET /health.
@@ -369,9 +369,11 @@ def _fallback_summary(objective: str, documents: List[Any]) -> str:
         ]
         if years:
             lines.append(f"- Publication years observed: {years[0]}–{years[-1]}.")
+        # "not configured" and "configured but every call failed" both land here, so
+        # the wording must cover both rather than asserting the first.
         lines.append(
-            "- No LLM provider is configured, so this listing is mechanical: it reports what "
-            "was retrieved without synthesising it."
+            "- No working LLM provider was available, so this listing is mechanical: it reports "
+            "what was retrieved without synthesising it. See GET /health for the reason."
         )
         lines.append("- Representative sources:")
         lines.extend(f"  - {getattr(document, 'title', 'Untitled')}" for document in documents[:6])
@@ -387,7 +389,7 @@ def _fallback_summary(objective: str, documents: List[Any]) -> str:
                 "supported": False,
                 "evidence": [],
                 "evidence_snippets": [],
-                "rationale": "No LLM provider was configured, so no claim was verified.",
+                "rationale": "No working LLM provider was available, so no claim was verified.",
             }
         ],
     }

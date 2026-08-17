@@ -1,34 +1,49 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Frontend — Autonomous Multi-Agent Research Assistant
 
-## Getting Started
+Next.js 16 (App Router) UI for the research pipeline. See the [root README](../README.md) for the full project, architecture, and deployment notes.
 
-First, run the development server:
+## Develop
 
 ```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+npm install
+cp .env.example .env.local     # NEXT_PUBLIC_BACKEND_URL, defaults to http://localhost:8000
+npm run dev                    # http://localhost:3000
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+The backend must be running separately (`cd ../backend && uvicorn app.main:app --reload --port 8000`). With the backend down, every page shows an error naming the URL it tried — it does **not** fall back to sample data.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## Checks
 
-## Learn More
+```bash
+npm run lint
+npx tsc --noEmit
+npm run build
+```
 
-To learn more about Next.js, take a look at the following resources:
+## Build output
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+`next.config.ts` sets `output: "export"`, so `npm run build` emits a **static** bundle to `out/`. There is no SSR and no Node server at runtime: every route is prerendered HTML, and all backend communication happens from the browser.
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+Two consequences worth knowing:
 
-## Deploy on Vercel
+- `NEXT_PUBLIC_BACKEND_URL` is inlined at build time. Changing it requires a rebuild.
+- Anything needing a request-time server (middleware, route handlers, ISR) is unavailable by design.
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+## Routes
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+| Route | Purpose |
+|---|---|
+| `/` | Prompt, live WebSocket progress, results, report downloads |
+| `/history` | Prior runs from `GET /history` |
+| `/reports` | Latest report plus `.md` / `.json` / `.pdf` downloads |
+| `/reports/detail?id=<run_id>` | One run's full report |
+| `/dashboard` | Run counts and critic-score stats, derived from stored history |
+
+## Deploy (Firebase Hosting)
+
+```bash
+npm run build
+firebase deploy --only hosting
+```
+
+`firebase.json` serves `out/` and rewrites all paths to `/index.html`.

@@ -133,7 +133,7 @@ class TestFallbacks:
         assert data["method"] == "heuristic"
         assert data["claim_checks"][0]["claim"] == FALLBACK_CLAIM
         assert data["claim_checks"][0]["supported"] is False
-        assert "No LLM provider is configured" in markdown
+        assert "No working LLM provider was available" in markdown
 
     def test_summary_fallback_with_no_documents(self, plan):
         markdown, _data = parse_json_section(summarize_with_provider(plan, []))
