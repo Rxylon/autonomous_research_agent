@@ -10,7 +10,7 @@
 
 **Live demo:** [research-ai-assistant-e5306.web.app](https://research-ai-assistant-e5306.web.app) · **API:** [ai-research-backend-y7av.onrender.com/docs](https://ai-research-backend-y7av.onrender.com/docs)
 
-> The demo runs on free tiers and is **noticeably degraded** compared to running locally. Read [Live demo vs. local](#live-demo-vs-local) before judging it — the first request after idle takes ~50 s, and depending on the deployed key state, summaries may come from a non-LLM fallback.
+> The demo runs on free tiers and is **degraded** compared to running locally. Read [Live demo vs. local](#live-demo-vs-local) first: the initial request after idle takes ~50 s, vector search is lexical rather than semantic, and run history resets whenever the instance sleeps. LLM synthesis and claim checking do work there.
 
 ---
 
@@ -49,15 +49,33 @@ Every response reports **how** the critic scored it — `llm` (a model checked t
 
 Query: *"Find recent advances in multimodal deepfake detection and summarize major approaches."*
 
-Returns a research plan, ~6–12 papers with abstracts and URLs, a synthesis, per-claim verification with cited source indices, and Markdown/JSON/PDF downloads. A real local run against arXiv retrieved:
+Returns a research plan, papers with abstracts and URLs, a synthesis with inline citations, per-claim verification, and Markdown/JSON/PDF downloads.
+
+Here is a real run against the deployed stack, abridged — note the citation markers and that the critic **rejected** the first claim:
 
 ```
-[planning    ] complete  Planner generated a research plan.
-[retrieval   ] complete  Retrieved 6 source documents.
-[summarizing ] complete  Summary generated.
-[critic      ] complete  Critic score: 0.64
-[report      ] complete  Report generated.
+critic_score:  0.75  (llm)
+claim_checks:  4
+
+* **Next-Frame Feature Prediction**: Recent single-stage training frameworks
+  incorporate next-frame feature prediction for both uni-modal and cross-modal
+  features alongside window-level attention mechanisms [1].
+* **Two-Stage Unimodal Detection and Score Fusion**: ... integrating their outputs
+  via multimodal score fusion to leverage complementary information [2].
+...
+
+claim:     Recent single-stage training frameworks incorporate next-frame feature
+           prediction for both uni-modal and cross-modal features ...
+supported: False
+rationale: Source [1] does not state that 'recent single-stage training frameworks'
+           broadly incorporate these features; rather, it explains that recent
+           single-stage methods struggle to generalize and require pretraining,
+           leading the authors to propose a new framework to address these
+           limitations.
 ```
+
+That rejection is the point of the tool. The summary overstated what its own source
+said, and the critic caught it — scoring 0.75 rather than waving it through.
 
 ---
 
@@ -70,7 +88,7 @@ Both tiers are free, and the trade-offs are structural rather than bugs. **Every
 | Full 5-stage pipeline | ✅ | ✅ |
 | WebSocket live progress | ✅ | ✅ (Render supports WebSockets) |
 | First-request latency | ~1 s | **~50 s** — free instances sleep after 15 min idle and cold-start the whole Docker image |
-| LLM summarization + claim checking | ✅ with a key | Depends on the key set in the Render dashboard. If absent, invalid, or rate-limited, summaries fall back to a **mechanical listing** and scores become keyword heuristics. `GET /health` reports this in `llm_configured` and `last_llm_error`, and the UI shows a banner. |
+| LLM summarization + claim checking | ✅ with a key | ✅ verified working (`critic_method: llm`). If the dashboard key is ever absent, invalid, rate-limited, or pointed at a retired model, summaries fall back to a **mechanical listing** and scores become keyword heuristics — `GET /health` reports exactly which in `llm_configured` and `last_llm_error`, and the UI shows a banner. |
 | Semantic vector search | ✅ Sentence-Transformers (`bge-small-en-v1.5`), via `requirements-local.txt` | ❌ **Lexical only.** 512 MB RAM cannot hold torch plus a transformer, so the image omits both and pins `EMBEDDING_BACKEND=hash` — a deterministic hashed bag-of-words. Retrieval still works but matches on shared tokens, not meaning. |
 | Run history | ✅ persists in `data/history.jsonl` | ⚠️ **Resets on restart.** The filesystem is ephemeral, so History, Reports, and Analytics empty out whenever the instance sleeps. |
 | Uploaded documents (`POST /upload`) | ✅ persist and influence later queries | ⚠️ Work within a session; the Chroma index is lost on restart |
